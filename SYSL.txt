@@ -1,0 +1,5 @@
+clear
+BLOCK >2000,>4000
+AD sys25O
+PSAVE sys25,5,>2000,SLAST
+EX
