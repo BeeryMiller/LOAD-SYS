@@ -1,0 +1,518 @@
+
+       DEF  START
+       DEF  SLAST
+       DEF  SFIRST
+
+       AORG >1FFA
+       DATA >0000,>0900,>A000   *TEMP HEADER to fix file offset
+
+       AORG >2000
+SLOAD
+SFIRST LWPI >F000        WORKSPACE
+       CLR  @>83C4
+       LIMI 0
+       LI   R1,>EE00     PAGE TO EXECUTE AT >2000
+       MOVB R1,@>8001    SET TO >2000 PAGE CONTROL
+       LI   R0,>A000     MOVE ALL CODE
+       LI   R1,>2000
+       LI   R2,SLAST-SLOAD+2
+MOVER  MOV  *R0+,*R1+
+       DECT R2
+       JNE  MOVER
+       B    @START       NOW START DOING IT
+
+
+
+; for GPL mode...
+; Add TIPI, PI, URI1,2,3 into the DSR table
+; if encountered, we map in page >BA and execute the call then return
+; This is probably the only real way we can seamlessly add TIPI for GPL mode and
+; retain the master DSR compatibility.   Start with TIPI device first.
+; Then we can look at REMAP for the disk devices, since they probably won't play
+;   nicely.
+; Level 2, well, that's probably REMAP only. No way for master DSR to sort it
+;   out.
+;
+; oh.. Use REMAP to branch to TIPI for a disk.  Screw TIPI device for now.
+; Not sure what happens with long pathname like DSK3.PATH.PATH.file
+; We have to pass before the OS does anything!
+;
+; potentially pass HDX1 this way. hmmm.
+;
+; See L8.HDR2-p2
+;   1. Add routine to find TIPI CRU
+;   2. Save TIPI CRU
+;   3. perform powerup
+;       - find TIPI CRU; set flag
+;       - cache the TIPI device(s) into the MDOS table, if found
+;       - check remaps for TIPI drive and adjust DSKx pointers?
+;       - (we will NOT allow conflicts in this manner)
+;       - in theory, hard drive devices could be managed this way.
+;       - problem... lack of space in this section of DSR.;
+;
+;   5. When TIPI is called,
+;       - page in BA
+;       - passthrough immediately to TIPI DSR
+;       - Ensure VDPWA and GPLWS set
+;       - pass error as needed
+;       - exit master DSR
+;
+; Remember, GPL mode is VDP only. We an probably make this very simple.
+; not sure about PI and other special DSR calls.  Let's start with TIPI.
+;
+; We can probably implement near-full TIPI capability in GPL mode.
+;
+;
+; HDR2-P2, PASS4A, is probably the cause. Master DSR all devices >1100. So we
+;          tailspin? Look deepr.
+
+*
+* TIPI MDOS LOADER test (ltipis)             July 2018
+*
+* We'll use the standard EA environment under ROMPAGE for test simplicity
+* Implementing a true boot loader will require a few more gymnastics
+*
+* TIPI is not sector-based so we must use the level 2 IO routines. For the
+*      sector-based devices, this would be marginally slower. Assume TIPI 7k/s
+*      so typical MDOS 128k/7k/s = 18.2s approximate load time
+*
+* The loader compares the SYSPATH to devicename "TIPI"
+*      If found, unit is forced to 0 and system DSRs ar scanned for "TIPI"
+*          If TIPI is in the system, loading proceeds; if not, return to GPL
+*
+*      If the SYSPATH is not "TIPI" then the standard CRU scan is completed
+*
+*      Level2 device subprograms are manually set. (will try to automate)
+*
+
+GPLWS  EQU  >83E0
+PADWS  EQU  >8320        our workspace above addinf block
+
+;
+;additional info
+;  -assumes level 2 offset >00 as set in 0x8350
+;
+ADDINF EQU  >8300        For level 2 Add'info block        BUFFER START ADDRESS
+SEC#   EQU  >8302        NUMBER OF FIRST SECTOR
+
+;      EQU  >8304        FILE FLAG ! RECS/SEC
+;      EQU  >8306        EOF OFFSET ! RECORD LENGTH
+;      EQU  >8308        NUMBER OF LEVEL 3 RECS
+MSB#   EQU  >830A        only needed for >>65535 sector files (so, never)
+;      EQU  >830C        maintain for compatibility if we do any direct output
+
+; VDP locations for PAB/buffer. Thanks, TI.
+PTHLEN EQU >0F80         <len><pathname> for level 2 IO
+NAMLEN EQU >0FE0         <len><sub> pab for level 2
+FNAME1 EQU >0FF0         10 character, space padded filename
+SECTOR EQU >1000         buffer
+
+*---------------------------------
+
+START  LIMI 0            shut down interrupts
+       LWPI GPLWS        start with gplws
+       CLR  @>834C       clear ISR hook
+
+       LWPI PADWS        Point to our WS, above level 2 addinfo block
+
+
+* We could force ROMPAGE here but for now let's leave it to the user
+
+; find TIPI
+; compare system path to "TIPI" device and if found, scan for TIPI CRU
+;      otherwise assume non-tipi
+;
+
+*      MOVB @HBA,@>8002
+
+       MOV  @DSKTIP17,@L2PATH   set up level2 subprograms; default to DSK/TIPI
+       MOV  @DSKTIP14,@L2DIN    "            "
+
+       LI  R0,>1800
+       MOV R0,@CRUTIPI
+       CLR R0
+
+
+;
+; Set the device number, expected path, and get the file parameters
+;
+;   parse the device number (->30) from the non-TIPI path
+;   could do this in the setpath routine along with lvl2 setup
+;
+
+ISATIP MOVB R0,@DEV#     0=TIPI; <>0 disk device
+
+       BL   @SETPATH          set the current path
+       DATA SYSPATH,L2PATH
+
+       BL   @GETPARMS         get the lvl2 parameters
+       DATA SYSNAME,L2DIN
+
+       MOVB @SYSPATH,R3
+       SRL  R3,8
+       MOV  R3,R2
+
+       LI   R0,32*10            show path.file to user (well, sort of)
+       LI   R1,SYSPATH+1
+       BLWP @VMBW
+
+       A    R3,R0
+
+       LI   R1,SYSNAME
+       LI   R2,10
+       BLWP @VMBW
+
+*
+* set up our loop and pagemaps - POINT OF NO RETURN
+*
+
+       CLR  @>830C       12.29.2020
+       MOV  @SEC#,R8     get total sectors from addinfo parameter
+
+       LI   R7,0
+       MOV  R7,@>8302
+
+       CLR  R6           starting CPU page to load MDOS
+       MOVB R6,@>8005    1.9.2021
+
+READMORE
+       MOVB @DEV#,@>834C
+       MOVB @H20,@>834D  32 sectors per pass later
+       LI   R0,FNAME1
+       MOV  R0,@>834E
+       MOVB @H00,@>8350
+
+       LI   R0,>1000     8k buffer for full load
+       MOV  R0,@>8300
+
+
+       LI   R0,NAMLEN
+       MOV  R0,@>8356
+       BLWP @DSRLNK
+       DATA 10
+
+* copy the file from VDP to CPU, in 8k chunks, to successive cpu ram pages
+       LI   R0,>1000     vdp
+       LI   R1,>A000     1.9.2021
+       LI   R2,>2000     1.9.2021
+
+       BLWP @VMBR
+       INC  R6           mdos page#
+       AB   @H01,@>8005  1.9.2021
+       AI   R7,32        next 32 sectors
+
+       MOV  R7,@>8302    12.29.2020
+
+       C    R7,R8
+       JL   READMORE
+
+* We have overwritten the existing OS at this point, so let's prep the mapper,
+*  trigger an OS restart, and cross our fingers.
+
+
+STARTOS B  @RESET        (see resets file)
+
+*-----------------------
+; SETPATH
+; some of the path lens might only be there for XB. Check manual
+;
+; 834c   unit# | unused
+; 834e   ^<len><pathname>
+; 8350   error | unused
+;
+; *In the HFDC/SCSI, the unit# is checked against path drive number
+;
+SETPATH
+       MOVB @DEV#,@>834C  ;set device unit
+
+       LI   R0,PTHLEN    vdp loc to write path
+       MOV  R0,@>834E
+
+       MOV  *R11+,R1     cpu loc of <len><path>
+       MOVB *R1,R2       get len byte
+       SRL  R2,8
+       INC  R2           include len byte for dsr
+       BLWP @VMBW        write to VDP (R0)
+
+       LI   R0,NAMLEN    vdp loc of  "pab" with len 1 + sub name
+       MOV  R0,@>8356    store in pad
+       MOV  *R11+,R1     get subroutine
+       LI   R2,2
+       BLWP @VMBW        write to VPD
+
+       MOVB @H00,@>8350
+       BLWP @DSRLNK      and call routine
+       DATA >A
+       MOVB @>8350,R0    mov error to R0 Msb
+       RT
+
+*-----------------------------------
+* BL @getparms
+* DATA ^sysname,^l2pab
+
+GETPARMS
+       MOVB @DEV#,@>834C
+       MOVB @H00,@>834D  0==parameter passing
+       LI   R0,FNAME1    vdp loc of filename
+       MOV  R0,@>834E
+       MOVB @H00,@>8350  addinfo at offset 00
+
+       CLR  @>8302     ;test fix for TIPI log
+
+
+       MOV  *R11+,R1
+       LI   R2,10
+       BLWP @VMBW        move to vdp
+
+       LI   R0,NAMLEN    vdp loc of  "pab" with len 1 + sub name
+       MOV  R0,@>8356    store in pad
+       LI   R1,L2DIN     >0124
+       LI   R2,2
+       BLWP @VMBW        write to VPD
+
+       BLWP @DSRLNK      and call routine
+       DATA >A
+       MOVB @>8350,R0    mov error to R0 Msb
+       RT
+
+WS#2   BSS  >20
+
+CRUTIPI DATA >0000       0=not found
+H00    BYTE >00
+H01    BYTE >01
+DEV#   BYTE >00
+
+TIPIDEV BYTE >04         used to locate CRU
+        TEXT 'DSK0'
+
+*----------------------------------------
+SYSPATH   BYTE 5        len includes required trailing period!
+          TEXT 'DSK0.                                   '
+
+SYSNAME   TEXT 'SYSTEM-SYS   '
+
+*------------------------------------------
+       EVEN
+DEVDSK TEXT 'DSK'
+       EVEN
+DEVWDS TEXT 'WDS'
+       EVEN
+DEVSCS TEXT 'SCS'
+       EVEN
+DEVIDE TEXT 'IDE'
+       EVEN
+DEVHDX TEXT 'HDX'
+       EVEN
+DEVTIP TEXT 'TIP'
+       EVEN
+L2PATH DATA >0117        set based on device
+L2DIN  DATA >0114
+
+DSKTIP17    DATA >0117
+DSKTIP14    DATA >0114
+
+*
+SCLEN  EQU  >8354
+SCNAME EQU  >8356
+CRULST EQU  >83D0
+SADDR  EQU  >83D2
+FLGPTR DATA 0
+SVGPRT DATA 0
+SAVCRU DATA 0
+SAVENT DATA 0
+SAVLEN DATA 0
+SAVPAB DATA 0
+SAVVER DATA 0
+NAMBUF DATA 0,0,0,0,0
+DLNKWS DATA 0,0,0,0,0
+TYPES  DATA 0,0,0,0,0,0,0,0,0,0,0
+C100   DATA 100
+H20    EQU  $
+H2000  DATA >2000
+DECMAL TEXT '.'
+HAA    BYTE >AA
+CYC1   DATA 0      my storage area
+H1300  DATA >1300
+
+DSRLNK DATA DLNKWS,DLENTR
+DLENTR MOV  *R14+,R5
+       SZCB @H20,R15
+       MOV  @SCNAME,R0
+       MOV  R0,R9
+       AI   R9,-8
+       BLWP @VSBR
+       MOVB R1,R3
+       SRL  R3,8
+       SETO R4
+       LI   R2,NAMBUF
+LNK$LP INC  R0
+       INC  R4
+       C    R4,R3
+       JEQ  LNK$LN
+       BLWP @VSBR
+       MOVB R1,*R2+
+       CB   R1,@DECMAL
+       JNE  LNK$LP
+LNK$LN MOV  R4,R4
+       JEQ  LNKERR
+       CI   R4,7
+       JGT  LNKERR
+       CLR  @CRULST
+       MOV  R4,@SCLEN
+       MOV  R4,@SAVLEN
+       INC  R4
+       A    R4,@SCNAME
+       MOV  @SCNAME,@SAVPAB
+
+SROM   LWPI GPLWS
+       CLR  R1
+       MOV  @H2000,@CYC1  SET UPPER CRU BOUNDARY TO >2000
+
+*-------------------------
+       MOV  @CRUTIPI,R12      TIPI device expected?  0==no
+*-------------------------
+
+TIPIFORCE
+       MOV  R12,@CRULST
+       SBO  0
+       LI   R2,>4000
+       CB   *R2,@HAA
+*      JNE  NOROM
+       A    @TYPES,R2
+       JMP  SGO2
+SGO    MOV  @SADDR,R2
+       SBO  0
+SGO2   MOV  *R2,R2
+*      JEQ  NOROM
+       MOV  R2,@SADDR
+       INCT R2
+       MOV  *R2+,R9
+       MOVB @SCLEN+1,R5
+       JEQ  NAME2
+       CB   R5,*R2+
+       JNE  SGO
+       SRL  R5,8
+       LI   R6,NAMBUF
+NAME1  CB   *R6+,*R2+
+       JNE  SGO
+       DEC  R5
+       JNE  NAME1
+NAME2  INC  R1
+       MOV  R1,@SAVVER
+       MOV  R9,@SAVENT
+       MOV  R12,@SAVCRU
+       BL   *R9
+       JMP  SGO
+       SBZ  0
+       LWPI DLNKWS
+       MOV  R9,R0
+       BLWP @VSBR
+       SRL  R1,13
+       JNE  IOERR
+       RTWP
+NODSR  LWPI DLNKWS
+LNKERR CLR  R1
+IOERR  SWPB R1
+       MOVB R1,*R13
+       SOCB @H20,R15
+       RTWP
+
+
+;=-=-=-=-==-===-
+* VDP UTILITIES
+* TI MODE VDP PORTS
+*
+VDPRD  EQU  >8800
+VDPWD  EQU  >8C00
+VDPWA  EQU  >8C02
+
+WRTMSK DATA >4000
+REGMSK BYTE >80
+       EVEN
+VSBW   DATA WS#2,$+2
+       BL   @VDP#          Setup VDP write address
+       MOVB @2(R13),@VDPWD    Write the character
+       RTWP
+
+VDP#   MOV  *R13,R0
+       SOC  @WRTMSK,R0
+VDP#2  SWPB R0
+       MOVB R0,@VDPWA     Send LOW BYTE
+       SWPB R0
+       MOVB R0,@VDPWA     Send HIGH BYTE
+       RT
+
+VMBW   DATA WS#2,$+2
+       BL   @VDP#
+       MOV  @2(R13),R1    Bring in CPU String Address
+       MOV  @4(R13),R2    Bring in # of Bytes to write
+       LI   R3,VDPWD
+VMBW20 MOVB *R1+,*R3       Write character
+       NOP
+       DEC  R2            Finished?
+       JNE  VMBW20        No
+       RTWP
+
+VSBR   DATA WS#2,$+2
+       BL   @VDP#3        Go setup VDP Address
+       MOVB @VDPRD,@2(R13)    Put character in R1 MSBYTE
+       RTWP               of calling workspace (WS#1)
+
+VMBR   DATA WS#2,$+2
+VMBRFW BL   @VDP#3        Go setup VDP Address
+       MOV  @2(R13),R1    Get CPU Buffer address
+       MOV  @4(R13),R2    Get # of Bytes to read
+       LI   R3,VDPRD
+VMBR20 MOVB *R3,*R1+   Move first byte
+       NOP
+       DEC  R2            Finished?
+       JNE  VMBR20        No
+       RTWP
+
+VDP#3  MOV  *R13,R0       Get VDP Address for read
+       ANDI R0,>3FFF      Reset BITS 0 & 1
+       JMP  VDP#2         Go finish up write address
+
+VWTR   DATA WS#2,$+2
+       MOV  *R13,R0       Get reg & data to write
+       ANDI R0,>3FFF      MASK out HIGH NIBBLE OR MSBYTE
+       SOCB @REGMSK,R0
+       BL   @VDP#2        Go do it
+       RTWP
+
+
+;=-=-=-=-=-=-
+* resets
+*      Restart OS. Assumes TI map mode
+*
+
+RESET
+DO9640 LWPI >F000
+       CLR  R4
+       MOVB R4,@>8000    page 0 in TI mapper mode
+       LI   R14,STUPST   move our code
+       LI   R15,>F080
+       LI   R12,>1EF4
+LOOP   MOV  *R14+,*R15+
+       CI   R14,STUPEN
+       JNE  LOOP
+       B    @>F080       u9995
+
+*
+* Start Geneve OS here using some self-moved code into PAD
+*       If hard drive load, flag is set for "HD". Research what
+*       this is used for. Geneve OS use it for autoexec?
+
+STUPST SBO  0            9640 mode
+*      CLR  @>F04E       (hard drive flag is... hd?)
+       LI   R0,'TI'
+       MOV  R0,@>F04E
+*      MOV  @DEVTIP,@>F04E                   TIP1.AUTOEXEC LOAD
+       CLR  @>F110       *ADD LABEL
+       BLWP @0
+STUPEN
+*
+
+SLAST  DATA 0
+       END
+*
