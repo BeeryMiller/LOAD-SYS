@@ -1,0 +1,348 @@
+***********************************************************************
+* LOAD/SYS for Myarc HFDC written by John Birdwell 3/19/1988
+*
+*    3/19/1988  Version 1.0 Released
+*    ?/ ?/1993  Version 1.x Update released by Jim Schroeder (1762 bytes)
+*
+*   09/19/2014  V1.0 source reconciled with Jim Schroeders binary
+*      - source assembles to match Schroeder release
+*      - floppy file locator routine replaced; SEC/AU calculated properly
+*      - fixes to keyboard scanning
+*      - flag passed to OS for autoexec processing
+*
+*      Items to fix/update
+*      - high and ultra-high density cluster parsing is not implemented
+*      - review fractured file routine; seem to recall an error that Jim
+*          fixed in PFM when he implemented the load routines
+*      - review multiple card boot options (SCSI, IDE, HorizonRAMdrive)
+*
+*  LOAD/SYS for HDCC only                                             *
+*  SYSTEM/SYS will be loaded from WDS1. (ROOT) if available           *
+*  if not the load will be attempted from floppy DSK1                 *
+*  if not found the user will be prompted to insert SYSTEM/SYS        *
+*  into DSK1 then the procdure will begin again via a re-start of the *
+*  ROM                                                                *
+*
+* This flow of the program is a follows:
+* Get sector 0 of WDS and locate root directoy
+*      if there is an error rtn test if HDCC was found
+*         if so try to load from its floppy else tell about error
+*           if load bad from floppy tell of error else startup
+* While on sector 0 of WDS also get the msb nibble of sectors/au
+* Next get the directory sector for root
+* Now try to locate the FDR for SYSTEM/SYS
+* If found load it else go try floppy
+*
+* AFTER ASSEMBLY AND CONVERSION TO PROGRAM IMAGE THE LOAD ADDRESS
+* MUST BE PATCHED FROM >2000 TO >A000
+*
+***************************
+* REGISTERS
+* RO GENERAL
+* R1 GENERAL
+* R2 GENERAL
+* R3 GOT HDCC FLAG
+* R4 LOW/MID  SECTOR # TO GET
+* R5 HIGH SECTOR #
+* R6 TOTAL SECTORS IN SYSTEM/SYS
+* R7 COUNTER FOR MEMORY MAPPER
+* R8  COUNTER FOR 64 SECTORS READ
+* R9  SECTORS/UA
+* R10 PAGE # TO LOAD TO
+* R11 LINK
+* R12 COUNT OF SECTORS IN CURRENT SEGMENT
+* R13
+* R14
+* R15
+***************************
+
+       DEF  SFIRST,SLOAD,SLAST
+       TITL 'LOAD/SYS V1.0 3/19/88  by John Birdwell'
+       IDT  'LOAD/SYS'
+
+* don't forget - this header will screw things up if the program exceeds it1
+
+       AORG >1FFA
+       DATA >0000,>06DC,>A000   *TEMP HEADER to fix file offset
+
+       AORG >2000
+SLOAD
+SFIRST LWPI >F000        WORKSPACE
+       CLR  @>83C4
+       LIMI 0
+       LI   R1,>EE00     PAGE TO EXECUTE AT >2000
+       MOVB R1,@>8001    SET TO >2000 PAGE CONTROL
+       LI   R0,>A000     MOVE ALL CODE
+       LI   R1,>2000
+       LI   R2,SLAST-SLOAD+2
+MOVER  MOV  *R0+,*R1+
+       DECT R2
+       JNE  MOVER
+       B    @GO          NOW START DOING IT
+
+*----execution starts in 0x2000 bank from here on
+
+GO     CLR  R7           MAPPER POINTER
+       CLR  R3           CLEAR FIRST I/O  FLAG
+       CLR  @FLPTRY      INIT FLAG FOR FLOOPY TRIED (See STUPST- OS flag forHD)
+
+       CLR  @AE          *add*-=-=-=-=-=-=-=-=-==
+
+       BL   @SETMAP      SETUP MAPPER  >A000
+       CLR  R4           GET SECTOR 0 OF WDS 1ST
+       LI   R9,1         SET SEC/AU TO 1 FOR NOW
+       LI   R10,MYBUF    SET TO LOAD DATA TO MY BUFFER
+       BL   @DSRSUB      DO I/O
+       JMP  NOWDS        NO SYSTEM/SYS FOUND OR HDCC NOT PRESENT
+
+       SETO R3           SET GOT A HDCC FLAG
+       MOVB @MYBUF+16,R9   GET THE SECTORS/UA -1
+       SRL  R9,12        ONLY WANT HIGH NIB
+       INC  R9           MAKE IT CORRECT
+
+       MOV  @MYBUF+26,@AJ   *add*-=-=-=-=-=-=-=-=
+
+       MOV  @MYBUF+24,R4       GET THE SECTOR # OF ROOT'S FDR POINTER TABLE
+       MOVB @MYBUF+22,@TOTFIL  SAVE THE TOTAL # OF FILES ON ROOT
+
+       LI   R10,MYBUF1
+       BL   @DSRSUB      NOW GET THIS SECTOR
+       JMP  NOWDS        ERROR RTN
+       BLWP @FNDFIL      GO SEE IF SYSTEM/SYS IS PRESENT
+       JMP  NOWDS        NOT FOUND ON WDS
+
+       MPY  R9,R12       CORRECT TOTAL SECTORS IN SEGMENT FOR MULT AU
+       MOV  R13,R12
+* NOW MAKE STARTING SECTOR # THE CORRECT 1 BASED UPON SEC/AU
+       MOV  R4,R1
+       MPY  R9,R1
+       MOV  R2,R4        GOT CORRECTED LOW/MID
+       MOV  R1,R5        GOT CORRECTED HIGH
+*
+* ON RETURN WE WILL HAVE ALL THE INFO TO START THE LOAD
+WLOOP  LI   R10,>A000    START LOAD LOCATION
+       LI   R8,64        LOAD 64 SECTORS
+WLOOP1 BL   @DSRSEC      GET A SECTOR
+       JMP  NOWDS        ERROR ON WDS
+       AI   R10,>0100    NEXT MEMORY BLOCK
+       INC  R4           GET NEXT SECTOR
+       JNE  NOWRAP       DON'T NEED TO INC HIGH YET
+       INC  R5
+NOWRAP DEC  R6           GOT ALL SECTORS
+       JEQ  DO9640       YES ALL DONE
+       DEC  R12          DEC. # OF SECTORS IN THIS SEGEMENT
+       JNE  WLOOP2       STILL MORE AVAILABLE
+       BLWP @GETSGW      GET ANOTHER SEGMENT OF SECTORS
+       MPY  R9,R12       CORRECT TOTAL SECTORS IN SEGMENT FOR MULT AU
+       MOV  R13,R12
+* NOW MAKE STARTING SECTOR # THE CORRECT 1 BASED UPON SEC/AU
+       MOV  R4,R1
+       MPY  R9,R1
+       MOV  R2,R4        GOT CORRECTED LOW/MID
+       MOV  R1,R5        GOT CORRECTED HIGH
+WLOOP2 DEC  R8           LOADED 16K?
+       JNE  WLOOP1       NO CONTINUE
+       BL   @SETMAP      MAP IN NEXT 16K
+       JMP  WLOOP        LOAD SOME MORE
+*
+* WDS LOAD FAILED SO TRY FLOPPY
+NOWDS
+       MOV  @SAVCRU,R12  TEST IF HDCC WAS FOUND
+       JEQ  NOHDCC       NO
+*r     MOV  @FLPTRY,R1   HAVE WE TRIED FLOPPY ALREADY?
+*r     MOV  @AD,@AD      *ADD*-=--=-=-==-=-==-=
+       MOV  @FLPTRY,@FLPTRY   did we try floppy?
+       JNE  HELP         YES GIVE UP
+       SETO @FLPTRY      No, so SET FLAG FOR FLOPPY IO
+* SINCE CRU BASE IS KNOWN WE NEED TO FIND WHERE FLOPPY SEC. I/O IS
+       MOV  @SAVCRU,R12
+*-=-=-=-=-=-=-=-=-=-==-=-=-=-ADDED
+       CI   R12,>1000    *add*  cru 1000?
+       JNE  AW           no
+       LI   R1,>85FF     yes, adjust for floppy 5-8
+       MOVB R1,@WDS      (2214)
+
+AW     SBO  0            TURN ON HDCC
+       LI   R2,>4000
+       CB   *R2,@HAA     ("aa" @22e9)
+       JNE  NOHDCC
+*-=-===-=-=-=-=-==-=-=-=-=-=-=-=-=-=-
+       LI   R2,>400A     GET ADDRESS OF SUBS
+       JMP  NOWDS2
+
+NOWDS1 MOV  R3,R2        ADDRESS OF SUB POINTER
+       SBO  0
+NOWDS2 MOV  *R2,R2
+       JEQ  HELP         IF NOT FOUND ERROR
+       MOV  R2,R3        SAVE NEXT 1
+       INCT R2
+       MOV  *R2+,R9       SAVE SUB START ADDRESS
+       MOV  @DDIO,R5     TEST IF THIS IS IT
+       CB   R5,*R2+      CORRECT LENGTH
+       JNE  NOWDS1       NO
+       SWPB R5
+       CB   R5,*R2+      GOT A >10
+       JNE  NOWDS1       NOT YET
+       MOV  R9,@SAVENT   MAKE THIS THE ENTRY POINT FOR I/O
+* NOW TRY TO FIND THE FILE ON THE FLOPPY
+
+       CLR  @TOTFIL      AK 2216
+*      CLR  @AK        -=2216  *ADD* -=-=-=-=-=-=-=
+*r*    JMP  HELP         NOT PRESENT ON FLOPPY
+
+       BL   @SETMAP      SETUP MAPPER  >A000
+       CLR  R4           GET SECTOR 0 OF floppy 1ST
+       LI   R9,1         SET SEC/AU TO 1 FOR NOW
+       LI   R10,MYBUF    SET TO LOAD DATA TO MY BUFFER
+       BL   @DSRSUB      DO I/O
+       JMP  HELP         FLOPPy error
+
+*-=-=-=-=-=-=-=-=-=-=-=-=START ADD-=-=-==-
+       INC  R4           now get sector 1?
+       LI   R10,MYBUF1   buffer (mybuf1?)27dc
+       BL   @DSRSUB
+       JMP  HELP
+       LI   R0,>0001
+       LI   R1,MYBUF1    >27DC     buffer (mybuf1?)
+BE     MOV  *R1+,R2
+       JEQ  BD
+       INC  R0
+       JMP  BE
+BD     SWPB R0
+*      movb R0,@ak       now find the file
+       MOVB R0,@TOTFIL
+       BLWP @FNDFIL     [al  (23a8)]
+       JMP  HELP
+       CLR  R7
+       CLR  R5
+       BL   @SETMAP
+       JMP  WLOOP
+*-=-==-=-=-=-=-=-=-==-=END ADD
+*r     MOVB @MYBUF+12,R0 FIGURe the sec/au for 1.44 meg floppy
+*r     SRL  R9,0
+*r     CI   R0,18        IS THERE GREATER THAN 18 TRACKS PER SECTOR
+*r     JLE  NOWDS3       NO
+*r     SLA  R9,1         SET MULTIPLIER TO 2
+*r NOWDS3 INC  R4           NOW Get sector 1 of floppy
+*r     LI   R10,MYBUF1   THIS is the root fcb
+*r     BL   @DSRSUB      DO I/o
+*r     JMP  HELP
+*r     CLR  R0           COUNT FILES
+*r     LI   R1,MYBUF1
+*r NOWDS4 MOV  *R1+,R2      GOT A FILE
+*r     JEQ  NOWDS5       NO
+*r     INC  R0
+*r     JMP  NOWDS4
+*r NOWDS5 MOV  R0,@TOTFIL   TOTAL FILES TO TEST
+*r     BLWP @FNDFIL      LOCATe SYSTEM/SYS
+*r     JMP  HELP         IF NOt found give up
+*r     CLR  R7
+*r     BL   @SETMAP      MAKE sure mapper is reset to start
+*r     JMP  WLOOP        SINCE the floopy has been setup to look like wds
+
+
+* we can use its load code
+*
+*
+* NO LOAD OFF OF WDS OR FLOPPY
+*
+NOHDCC LI   R0,BADDSR    BAD DSR MESSAGE
+       JMP  SHOW
+HELP   LI   R0,NOSYS     NO SYSTEM/SYS MESAGE
+SHOW   LI   R12,>1EF4    PUT Into 960 mode
+       SBO  0
+       B    @BADLOD
+*
+DO9640 LWPI >F000
+       CLR  R4
+       MOVB R4,@>8000
+       LI   R14,STUPST
+       LI   R15,>F080
+       LI   R12,>1EF4
+LOOP   MOV  *R14+,*R15+
+       CI   R14,STUPEN
+       JNE  LOOP
+       B    @>F080
+
+*
+* Start Geneve OS here using some self-moved code into PAD
+*       If hard drive load, flag is set for "HD". Research what
+*       this is used for. Geneve OS use it for autoexec?
+
+STUPST SBO  0
+       MOV  @BL,@>F04E   *add -=-===         set hard drive flag for os
+       MOV  @FLPTRY,R1       *add -=-=-=
+       CI   R1,>FFFF     *add -=-=-= =       if ffff, clear hd flag for os
+       JNE  BM           *add -=-=-=
+       CLR  @>F04E
+BM     CLR  @>F110       *ADD LABEL
+       BLWP @0
+STUPEN
+*
+SETMAP MOVB R7,@>8005    SET TO MAP LOGICAL >A000
+       AI   R7,>0100
+       MOVB R7,@>8006    SET TO MAP LOGICAL >C000
+       AI   R7,>0100
+       RT
+*
+DSRSEC MOV  @WDS,@DRIO
+       MOV  R4,@SECLM    LOAD LOW/MID
+       MOV  R5,@SECH     LOAD HIGH
+       JMP  DSRSC1
+*
+*
+DSRSUB MOV  @WDS,@DRIO   SET DRIVE # AND READ FLAG
+       MOV  R4,R1        SECTOR # TO GET
+       MPY  R9,R1        MPY SEC/AU BY THE SECTOR TO GET
+       MOV  R2,@SECLM    LOAD LOW AND MID
+       MOV  R1,@SECH     LOAD HIGH
+DSRSC1 MOV  R10,@PONTR   CPU BUFFER TO LOAD TO
+
+       MOV  @AE,@AE      *add*-=-=-=-=-=-=-=-=-=-==-=-==-==-=-==
+*r*    MOV  R3,R3        ALREADY KNOW HDCC PRESENT
+
+       JNE  FDSRL        YES
+       BLWP @WDRLNK      I/O
+       DATA 10
+       SETO @AE          *ADD*-=-=-=-=-=-==
+       JMP  TSTRTN
+FDSRL  BLWP @DSRLNK      DO INITIAL I/O
+       DATA 10
+TSTRTN MOVB @SECLM,@SECLM     ANY ERROR
+       JNE  DSRERR       YES
+       INCT R11          GOOD RTN
+DSRERR RT
+*
+DRIO   EQU  >834C        DRIVE AND I/O TYPE
+PONTR  EQU  >834E        POINTER TO CPU BUFFER
+SECLM  EQU  >8350        SECTOR # TO GET LOW/MOD
+SECH   EQU  >8352        SECTOR # TO GET HIGH
+WDSIO  DATA >0120        WDS I/O TYPE
+DDIO   DATA >0110        SECTOR I/O FLOPPY
+
+AE     DATA >0000        *add* -=-=--=-==
+BL     TEXT 'HD'         *add* -=-===-==-=
+
+WDS    BYTE >81          (2214)
+FF     BYTE >FF
+
+*-=-===-=-==-=-=-=-=-=-==ADD 3, OVERLAP NEXT 2. -=-=-=-=
+TOTFIL
+AK     DATA 0
+AJ     DATA 0            TOTfil and FLPtry overlap
+FLPTRY
+AD     DATA 0            (221a)  ffff=FLOPPY
+
+*r TOTFIL BYTE 0            TOTAL FILES IN ROOT
+*r FLPTRY DATA 0            FLOPPY TRIED FLAG
+*---------------------
+
+NOSYS  BYTE 39
+       TEXT 'CANNOT LOCATE '
+SYSSYS TEXT 'SYSTEM/SYS FILE ON HFDC'
+ASK1   BYTE 24
+       TEXT '  PRESS ANY KEY TO RETRY'
+BADDSR BYTE 38
+       TEXT '  CANNOT LOCATE HARD/FLOPPY CONTROLLER'
+       EVEN
+*

@@ -1,0 +1,5 @@
+       LIST
+       COPY "LS-MAIN"
+       COPY "LS-SUP"
+       COPY "LS-BOOT"
+       END

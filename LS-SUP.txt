@@ -1,0 +1,286 @@
+*
+******************************
+*  SYSTEM SUPPORT UTILITIES  *
+******************************
+*
+VSBR   DATA >8300,VSBRO       same (8300,>2286)
+VSBRO  BL   @VPADD1
+       MOVB @>8800,@2(R13)
+       RTWP
+*
+VPADD1 CLR  R1
+       MOV  *R13,R2
+       MOVB @VPLAD,@>8C02
+       SOC  R1,R2
+       MOVB R2,@>8C02
+       MOV  @2(R13),R1
+       MOV  @4(R13),R2
+       RT
+*
+VPLAD  EQU  >8305
+SCLEN  EQU  >8354
+SCNAME EQU  >8356
+CRULST EQU  >83D0
+SADDR  EQU  >83D2
+GPLWS  EQU  >83E0
+
+FLGPTR DATA 0            same
+SVGPRT DATA 0            data
+SAVCRU DATA 0            but
+SAVENT DATA 0            not
+SAVLEN DATA 0            all
+SAVPAB DATA 0            labels used
+SAVVER DATA 0            here
+NAMBUF DATA 0,0,0,0,0
+DLNKWS DATA 0,0,0,0,0
+TYPE   DATA 0,0,0,0,0,0,0,0,0,0,0
+C100   DATA 100
+
+H20    EQU  $
+H2000  DATA >2000
+DECMAL TEXT '.'
+HAA    BYTE >AA          22e9
+*
+* dsrlnk the same
+*
+WDRLNK DATA DLNKWS,WLENTR  (22c4,22ee)   WDS DSRLNK ENTRY INIT I/O
+WLENTR MOV  *R14+,R5
+       SZCB @H20,R15
+SROMW  LWPI GPLWS
+       LI   R12,>0F00    START OUT WITH 1ST CRU BASE
+       CLR  @SAVCRU      NO CRU FOUND YET
+NOROMW AI   R12,>0100    NEXT CRU
+       CI   R12,>2000    TESTED ALL POSSIBLE
+       JEQ  NODSRW       YES HDCC NOT FOUND
+       SBO  0            TURN ON BOARD
+       LI   R2,>4000
+       CB   *R2,@HAA
+       JNE  NOROMW
+       A    @TYPE,R2
+       JMP  WSGO2
+WSGO   MOV  @SADDR,R2
+       SBO  0
+WSGO2  MOV  *R2,R2       ANY ENTRIES AVAILABLE
+       JEQ  NOROMW       NO
+       MOV  R2,@SADDR
+       INCT R2
+       MOV  *R2+,R9      EXECUTE ADDRESS
+       MOV  @WDSIO,R5    TEST IF LENGTH IF SUB IS A 1
+       CB   R5,*R2+      IS IT?
+       JNE  WSGO         NO
+       SWPB R5           NOW TEST FOR CALL TYPE OF WDS FILE I/O
+       CB   R5,*R2+      IS IT?
+       JNE  WSGO         NOT YET
+* IF WE GET HERE THEN THIS IS THE HFDC CARD
+       MOV  R9,@SAVENT   SAVE TO START ADDRESS FOR WDS FILE I/O SUB
+       MOV  R12,@SAVCRU  SAVE CRU BASE FOR BOARD
+       BL   *R9          GO DO THE OPEN
+       JMP  NODSRW       TAKE RTN FOR NOT FOUND OF SYS/SYS ON WDS ROOT
+       SBZ  0            TURN OFF BOARD
+       LWPI DLNKWS
+       MOV  R9,R0
+       BLWP @VSBR
+       SRL  R1,13
+       JNE  IOERRW
+       RTWP
+NODSRW LWPI DLNKWS
+       CLR  R1
+IOERRW SWPB R1
+       MOVB R1,*R13
+       SOCB @H20,R15     ERROR STATUS
+       RTWP
+*
+* DSKLNK FOR GETTING FILE NOW THAT CRU BASE AND ENTRY POINT ARE KNOWN
+*      (same as jim's)
+DSRLNK DATA >F040,DLENTR   (236e)
+DLENTR MOV  *R14+,R5
+       SZCB @H20,R15
+       LWPI GPLWS
+       MOV  @SAVCRU,R12  CRU BASE FOR HDCC
+       SBO  0            TURN IT ON
+       MOV  @SAVENT,R9   NOW GET ENTRY POINT FOR SUB
+       BL   *R9          GO TO IT
+       JMP  NODSR
+       SBZ  0
+       LWPI >F040
+       MOV  R9,R0
+       BLWP @VSBR
+       SRL  R1,13
+       JNE  IOERR
+       RTWP
+
+* same
+NODSR  LWPI >F040
+LNKERR CLR  R1
+IOERR  SWPB R1
+       MOVB R1,*R13
+       SOCB @H20,R15
+       RTWP
+*
+************************************************
+* THIS ROUTINE WILL SEARCH FOR THE FDR FOR SYSTEM/SYS
+* FOR EITHER WDS OR FLOPPY AND SET THINGS UP FOR LOAD IF FOUND
+* RETURN IS +2 IF FOUND
+* IF NOT FOUND RETURN IS NORMAL
+************************************************
+*
+FNDFIL DATA >F020,FIND
+FIND   MOVB @TOTFIL,R6        Get files count in root
+       JEQ  NOTFND            No files in root
+       SRL  R6,8
+       CLR  R12               Last FDR accessed
+       CLR  R5                Low sector
+FINDF3 MOV  R5,R7             Work L
+       MOV  R6,R8             Work H
+       S    R7,R8             H-L
+       CI   R8,1              End of Search
+       JEQ  FINDF4            Yes, no divide
+       SRL  R8,1              Divide by 2
+FINDF4 A    R5,R8             +L
+       C    R12,R8            Has this FDR been tried
+       JEQ  NOTFND            Yes, file not found
+       MOV  R8,R12            Save this as last
+       SLA  R8,1              Make a word
+       AI   R8,MYBUF1-2        Point to an entry
+       MOV  *R8,R4            Fdr to read
+       LI   R10,MYBUF
+       MOV  @18(R13),R9       GET SECTOR/AU  (dsrsub mpy r9*r1 for sector#)
+       BL   @DSRSUB
+       JMP  NOTFND       DISK ERROR
+       LI   R2,SYSSYS         File name
+       LI   R3,10
+FINDF5 CB   *R2+,*R10+        Is this the file
+       JEQ  FINDF6            Good do far
+       JLT  FINDF7            file read > file needed
+       MOV  R12,R5            Number read < number needed New L
+       JMP  FINDF3            Try again
+FINDF6 DEC  R3                All 10 tested
+       JNE  FINDF5            not yet
+* FOUND SYSTEM/SYS SO SETUP LOAD PARMS
+* MAKE SURE THIS IS A PROGRAM FILE
+       MOVB @MYBUF+12,R2      GET FILE STATUS BYTE
+       SLA  R2,8         TEST PROGRAM FLAG
+       JNC  NOTFND       ITS NOT A PGM FILE
+       MOV  @MYBUF+14,@12(R13)   MOVE TOTAL SECTORS TO CALLER R6
+
+* Now test if this is a FLOPPY or HARD DRIVE
+       MOV  @FLPTRY,R0   DOING FLOPPY
+       JNE  FLPSYS       YES SET IT UP FOR A LOAD
+       MOV  @MYBUF+40,R1     GET STARTING SECTOR IN 1ST CLUSTER
+       MOV  R1,@8(R13)       MOVE IT TO CALLERS R4
+       MOV  @MYBUF+42,R2    GET ENDING SECTOR IN CLUSTER
+       S    R1,R2             FIGURE TOTAL SECTORS IN CLUSTER
+       INC  R2
+       MOV  R2,@24(R13)       MOVE THIS TO CALLERS R12
+       LI   R1,52             TOTAL OF 52 MORE CLUSTERS ARE POSSIBLE
+       MOV  R1,@MXCLU         SAVE IT
+       LI   R1,MYBUF+44       SET POINTER TO NEXT CLUSTER START
+FLPRTN MOV  R1,@SEGSRT        SAVE IT
+       INCT R14               Good return
+NOTFND RTWP
+
+FINDF7 MOV  R12,R6       New H
+       JMP  FINDF3       Try again
+*
+* IF LOAD DEVICE IS A FLOPPY WE MUST 1ST BUILD A TABLE OF ITS CLUSTERS
+* LIKE THAT OF A WDS
+*
+* one bugfix in cluster section?
+*
+* High density and beyond require us to computer the proper sectors by
+*      multiplying the cluster info. (incomplete as of 9.19)
+*
+FLPSYS LI   R7,MYBUF+28  START OF CLUSTERS
+       LI   R8,FLPTAB
+       CLR  R10
+       CLR  R9           COUNT OF CLUSTERS
+FLPSS1 MOV  *R7,R3       GET START OF CLUSTER
+       JEQ  NOFC         NO MORE
+       SWPB R3           REVERSE ORDER
+       MOVB R3,R4        SAVE LSB OF COUNT
+       ANDI R3,>0FFF     REMOVE COUNT
+       MOV  R3,*R8+      PUT START SECTOR IN FLOPPY CLUSTER TABLE
+       INCT R7           NOW GET THE MSB OF COUNT
+
+
+*r     SLA  R4,4         GET Rid of any high nibble
+       SRL  R4,12        MOVE LSB TO BOTTOM OF WORD
+
+       MOV  *R7,R5       GET HIGH MSB
+       SRL  R5,4         MOVE TO CORRECT SPOT
+       ANDI R5,>0FF0     CLEAR OUT OTHER BITS
+       A    R5,R4        WE NOW HAVE THE COUNT OF CONTIGUS SECTORS
+       S    R10,R4       SUBTRACT COUNT OF THOSE DONE
+       A    R4,R10
+       INC  R10
+       A    R4,R3        THIS IS NOW THE ACTUAL END SECTOR
+       INC  R9           ADD TO COUNT OF CLUSTERS
+       MOV  R3,*R8+      SAVE ENDING SECTOR #
+       MOV  *R7,R3       NOW TO AN ODD CLUSTER
+       ANDI R3,>00FF     REMOVE COUNT OF PREVIOUS
+       MOV  R3,R3        IF ZERO DONE
+       JEQ  NOFC
+       INCT R7
+       MOV  *R7,R5
+       ANDI R5,>0F00
+       A    R5,R3        NOW Have start of next cluster
+       MOV  R3,*R8+
+       MOV  *R7,R6       GET Its end
+       SRL  R6,12
+       MOV  *R7,R5
+       SLA  R5,4
+       ANDI R5,>0FF0
+       A    R5,R6
+       S    R10,R6
+       A    R6,R3
+       A    R6,R10
+       INC  R10
+       MOV  R3,*R8+       ENDINg sector
+       INC  R9           ADD To cluster count
+       INCT R7
+       JMP  FLPSS1       DO AN even cluster
+*
+NOFC   MOV  @FLPTAB,R1       NOW Setup callers start/end sectors
+       MOV  R1,@8(R13)        callers r4
+       MOV  @FLPTAB+2,R2      get ending cluster #
+       S    R1,R2
+       INC  R2
+       MOV  R2,@24(R13)
+       MOV  R9,@MXCLU         save the # of clusters
+       LI   R1,FLPTAB+4       Set start of floppy clusters to do
+       B    @FLPRTN
+
+
+*
+* UPDATE STARTING SECTOR IN CLUSTER FOR THE LOAD FILE
+*
+SEGSRT DATA 0
+MXCLU  DATA 0            COUNTER FOR # OF CLUSTERS IN FDR
+GETSGW DATA >F020,GTSGW  (24ca)
+GTSGW  MOV  @SEGSRT,R1   GET POINTER TO NEXT CLUSTER START
+       MOV  *R1+,R2      START
+       MOV  *R1+,R3      END
+       MOV  R1,@SEGSRT   SAVE NEXT CLUSTER START
+       MOV  R2,@8(R13)   NEW SECTOR TO START LOAD
+       S    R2,R3        GET TOTAL SECTORS IN THIS CLUSTER
+       INC  R3
+       MOV  R3,@24(R13)  MOVE IT TO CALLERS R12
+       DEC  @MXCLU       DECREMENT COUNT OF CLUSTERS IN THE FDR
+       JNE  GTSGW2       MORE AVAILABLE
+*
+* ITS GOING TO TAKE A REALLY FRAMENTED SYSTEM/SYS TO EVER GET THIS FAR
+*
+       MOV  @MYBUF+32,R4 GET THE NEXT FDR FOR FILE
+       MOV  @18(R9),R9   GET THE SECTORS/AU VALUE
+       LI   R10,MYBUF    GET NEW FDR
+       BL   @DSRSUB      GET IT
+       JMP  NOTFDJ       TAKE ERROR EXIT
+       LI   R1,54        RESET TO TOTAL #  CLUSTERS POSSIBLE
+       MOV  R1,@MXCLU
+       LI   R1,MYBUF+40  SET TO START OF CLUSTERS IN THIS FDR
+       MOV  R1,@SEGSRT
+GTSGW2 RTWP
+*
+NOTFDJ LWPI >F000        MAIN ws
+       B    @NOWDS
+*
