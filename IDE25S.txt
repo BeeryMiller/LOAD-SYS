@@ -1,0 +1,854 @@
+************************************************************************
+*                                                                      *
+* SCSI/SYS                                                             *
+*                                                                      *
+* Adapted from John Birdwell's original LOAD/SYS source code.          *
+*                                                                      *
+* SYSTEM/SYS will be loaded from SCS1. (ROOT) if available.            *
+* If error, the user will be prompted to press a key to re-boot.       *
+*                                                                      *
+* version 1.0 - 03/06/2002  No error checking of data, but works.  APK *
+* version 2.0 - 03/09/2002  CRC error checking invoked.            APK *
+* version 2.1 - 03/27/2002  Powerup added for card at cru >1100    APK *
+* version 2.2 - 04/27/2019  CRC modified to lookup table method    TT  *
+* version 2.3 - 04/28/2019  DSR now loads OS directly to pages;    TT  *
+*                           no intermediate copying.                    *
+************************************************************************
+*                                                                      *
+* AFTER ASSEMBLY AND CONVERSION TO PROGRAM IMAGE THE LOAD ADDRESS      *
+*   (offset >0004-0005  must BE PATCHED FROM >2000 TO >A000            *
+*                                                                      *
+************************************************************************
+*                                                                      *
+* Registers                                                            *
+*                                                                      *
+* RO general                                                           *
+* R1 general                                                           *
+* R2 general                                                           *
+* R3 got SCSI flag                                                     *
+* R4 low/mid  sector # to get                                          *
+* R5 high sector #                                                     *
+* R6 total sectors in SYSTEM/SYS                                       *
+* R7 counter for memory mapper                                         *
+* R8 counter for 64 sectors read                                       *
+* R9 sectors/ua                                                        *
+* R10 page # to load to                                                *
+* R11 link                                                             *
+* R12 count of sectors in current segment                              *
+* R13                                                                  *
+* R14                                                                  *
+* R15                                                                  *
+*                                                                      *
+************************************************************************
+       DEF  SFIRST,SLOAD,SLAST
+       TITL 'IDE_SYS V2.5i  Originally SCSI/SYS'
+       IDT  'IDE_SYS'
+IDECRU EQU  >1900
+
+       AORG >2000
+SLOAD
+SFIRST LWPI >F000             workspace
+       CLR  @>83C4
+       LIMI 0
+       LI   R1,>E900     ; requres extra 32K; avoid GPL rompage interference
+;      LI   R1,>EE00          page to execute at >2000
+       MOVB R1,@>8001         set to >2000 page control
+       LI   R0,>A000          move all code
+       LI   R1,>2000
+       LI   R2,SLAST-SLOAD+2
+MOVER  MOV  *R0+,*R1+
+       DECT R2
+       JNE  MOVER
+       B    @GO               branch to execute in >2000 space
+
+CRCFLG DATA >0000        0=disable CRC; "CCCC" enable CRC
+
+GO     LWPI >83E0             load gpl ws
+; Ok.. why are we doing this for SCSI and IDE? Research. 7-13-2019
+       LI   R12,>1100         power up card at >1100
+       SBO  0                 turn on card
+       CB   @>4000,@HAA       is it a valid dsr?
+       JNE  PWR2              no
+       MOV  @>4004,R9         is there a powerup header?
+       JEQ  PWR2              no
+       MOV  @2(R9),R9         move powerup start address to r9
+       JEQ  PWR2              exit if no code there
+       BL   *R9               execute powerup
+       NOP                    wait, or skip error return
+PWR2   SBZ  0                 turn off card
+;---
+       LWPI >F000             back to our ws
+       LI   R2,VRGTBL         load VDP registers
+MEXREG MOV  *R2+,R1
+       JEQ  MEXRE1
+       BL   @SETVRH
+       JMP  MEXREG
+*   clear screen
+MEXRE1 LI   R1,>0040          set address of write
+       BL   @SETVRH
+       LI   R2,24*40          40*24 screen
+       LI   R1,>2020          fill with blanks
+CLKLOP MOVB R1,@VDPWE
+       DEC  R2
+       JNE  CLKLOP
+*   display message box
+       LI   R0,LOADNG
+       LI   R1,>6941          put on line 11
+       BL   @PUTMSH
+*   load in character set
+       LI   R1,>C048
+       BL   @SETVRH
+       LI   R1,CHRSET
+       LI   R2,CHRSEU-CHRSET
+DTBLOP MOVB *R1+,@VDPWE
+       DEC  R2
+       JNE  DTBLOP
+       CLR  R2
+DTBLO1 DEC  R2
+       JNE  DTBLO1
+       CLR  R7                mapper pointer
+       CLR  R3                clear first i/o  flag
+       BL   @SETMAP           setup mapper  >A000
+       CLR  R4                get sector 0 of SCS 1st
+       LI   R9,1              set sec/au to 1 to read sector zero
+       LI   R10,MYBUF         set to load data to my buffer
+       BL   @DSRSUB           do i/o
+       JMP  NOSCS             no SYSTEM/SYS found or SCSI not present
+       SETO R3                set got a SCSI flag
+       MOVB @MYBUF+16,R9      get the sectors/ua -1
+       SRL  R9,12             only want the high nib
+       INC  R9                make it correct
+       MOV  @MYBUF+24,R4      get sector # of root's fdr pointer table
+       MOVB @MYBUF+22,@TOTFIL save total # of files on root
+       LI   R10,MYBUF1
+       BL   @DSRSUB           get this sector
+       JMP  NOFDR             error return
+       BLWP @FNDFIL           go see if SYSTEM/SYS is present
+       JMP  NOSYS             not found on SCS
+       MPY  R9,R12            correct total sctrs in segment for mult au
+       MOV  R13,R12
+*   make starting sector # the correct 1 based upon sec/au
+       MOV  R4,R1
+       MPY  R9,R1
+       MOV  R2,R4             got corrected low/mid
+       MOV  R1,R5             got corrected high
+
+*   on return we will have all the info to start the load
+; 4.28  No need to load the OS into a temporary buffer. Let's let the DSR
+;      put the data where it belongs in the first place.
+
+WLOOP  LI   R10,>A000         start load location
+       LI   R8,64             load 64 sectors
+
+WLOOP1 MOV  R10,R1       4.28 Modified routine to set address via R10/R1
+       BL   @DSRSEC           get a sector  (r1 dest is hardcoded in routine)
+       JMP  NODATA            error on sector
+
+;      LI R0,>0100       4.28 Eliminate intermediate buffering; see DSRSEC also
+;      LI   R1,SECBUF
+;      MOV  R10,R2
+;WLOOP3 MOVB *R1+,*R2+
+;      DEC  R0                done?
+;      JNE  WLOOP3            not yet
+
+       AI   R10,>0100         next memory block
+       INC  R4                get next sector
+       JNE  NOWRAP            don't need to inc high yet
+       INC  R5
+NOWRAP DEC  R6                got all sectors
+       JEQ  DO9640            yes all done
+       DEC  R12               dec # of sectors in this segmentT
+       JNE  WLOOP2            still more available
+       BLWP @GETSGW           get another segment of sectors
+       MPY  R9,R12            correct total sctrs in segmnt for multi au
+       MOV  R13,R12
+*   make starting sector # the correct 1 based upon sec/au
+       MOV  R4,R1
+       MPY  R9,R1
+       MOV  R2,R4             got corrected low/mid
+       MOV  R1,R5             got corrected high
+WLOOP2 DEC  R8                loaded 16k?
+       JNE  WLOOP1            no continue
+       BL   @SETMAP           map in next 16k  (next two memory banks)
+       JMP  WLOOP             load in some more
+
+
+*   SCSI load failure messages
+NODATA LI   R0,NOTINT         SYSTEM/SYS data not intact
+       JMP  SHOW
+NOFDR  LI   R0,NOFDR1         No root FDR table
+       JMP  SHOW
+NOSCS  LI   R0,NOSCS1         No SCSI card
+       JMP  SHOW
+NOSYS  LI   R0,NOSYS1         No SYSTEM/SYS
+SHOW   LI   R12,>1EF4         Put into 9640 mode
+       SBO  0
+       B    @BADLOD
+*   MDOS is loaded, so do the CRC calculation
+DO9640 ABS @CRCFLG       0=skip CRC
+       JNE  DO969
+       B   @STRTUP
+
+DO969  LI   R0,CRCCHK         put in 'Calculating CRC for MDOS ...'
+       LI   R1,>0A42          in last line of box
+       BL   @PUTMSH
+
+********************************************************************************
+* CRC162s   2013 April 5 - Table driven CRC for MDOS integrity check   TT
+*
+*      1. Copy MDOS CRC calc routine into 9995 internal RAM @>F020-end
+*      2. Generate 512 byte CRC table in execution page
+*      3. Use table to compute CRC
+*
+*      Approximate execution speed under emulation:
+*      1. 8.5s    CRC calculated 'old faithful' way one byte at a time
+*      2. 4.5s    CRC calculated with table; local page execution
+*      3. 3.0s    CRC calculated with table; primary loop in 9995 scratchpad
+*
+* start at page 0, i.e. R4=0
+* change paging from *R4 to R4
+
+       BL   @COPY9995         Move to 9995 RAM @>F020
+       BL   @GENERATECRC16    Generate the lookup table
+
+       LI   R3,16        number of pages
+
+       CLR  R4    ; start at os page 0
+       LI   R5,CRCLIST   location to store CRC bytes
+       LI   R9,MDOSCRC   location to put the MDOS CRC (from memory)
+*
+       BL   @>F020       ** call into on-board RAM
+       BL   @RESTORE9995 ** Restore internal RAM
+
+       LI   R0,MDOSCRC        compare calculated to embedded
+       LI   R1,CRCLIST
+       LI   R2,16
+NEXT11 INV  *R0               simple INVert keeps CRC values obfuscated
+       C    *R0+,*R1+         match?
+       JNE  NOGOOD            NO, BAD file / changed
+       DEC  R2
+       JNE  NEXT11
+
+        B  @STRTUP        @GOODOSSTART
+
+NOGOOD  B  @NODATA       @BADOSFAIL
+
+
+*------------------------------------------------
+* Run this code in 9995 internal RAM
+* approx 66 bytes (0xF020-F062) - careful of internal WS's at 0xF080+
+* (note: this routine is running in 4A map mode; CRCOS runs in 9640 mode)
+*
+STARTCHIPCODE
+      CLR   R4   ; start page 0
+NEXTPAGE
+      MOVB R4,@>8005 A000 area
+      AI   R4,>0100  next page in mdos load when we jump to nextpage
+      LI   R0,>A000
+      CLR  R8     clear the crc each 8k page
+
+NEXTBYTE
+       CI   R3,13        PGETBL+11? (4TH PAGE)
+       JNE  NOSKIP       NO, NO NEED TO SKIP those bytes..
+       CI   R0,>A022     >2022     if less, don't skip CRC computation
+       JL   NOSKIP
+       CI   R0,>A042     >2042     if >2040 or higher, don't skip anymore
+       JHE  NOSKIP
+       MOVB *R0+,*R9+     store in the MDOS CRC!
+       JMP  SKIPIT
+*
+* COMPUTE THE CRC using our CRC table (generated earlier)
+*
+NOSKIP MOVB *R0+,R1      GET character from buffer
+       XOR  R8,R1        XOR the MSByte!
+       SRL  R1,7         we want a word index. Don't need to mask LSbit
+       SLA  R8,8         Shift the old result 8 bits
+       XOR  @CRCTABLE512(R1),R8    *combined table lookup with XOR!
+*** optimize by unrolling a 2nd instance (can't exceed two due to MDOS crc test)
+       MOVB *R0+,R1
+       XOR  R8,R1
+       SRL  R1,7
+       SLA  R8,8
+       XOR  @CRCTABLE512(R1),R8
+
+SKIPIT CI   R0,>C000         >4000          end of this page?  (DEC is one less
+
+       JL   NEXTBYTE          no, get another
+
+       MOV  R8,*R5+           yes,add CRC to the list
+       DEC  R3                any pages left?
+       JNE  NEXTPAGE          yes, start again
+       RT              *** remove if we don't move to on-chip!
+ENDCHIPCODE
+
+****************************************
+* Copy above code into 9995 internal RAM
+*
+COPY9995
+       LI   R1,STARTCHIPCODE
+       LI   R2,>F020
+       LI   R7,SAVE9995
+       CLR  R8
+CHIPLP MOV  *R2,*R7+          ultra-conservative - save scratchpad
+       MOV  *R1+,*R2+         then move code
+       INC  R8                # of words are we overwriting
+       CI   R1,ENDCHIPCODE    end of code?
+       JNE  CHIPLP            not yet
+       MOV  R8,@CT9995    yes.  save the word count for exit
+       RT
+
+RESTORE9995
+       LI   R1,SAVE9995
+       LI   R2,>F020
+REST1  MOV  *R1+,*R2+
+       DEC  @CT9995
+       JNE  REST1
+       RT
+
+*******************************
+* Generate CRC-16 lookup table
+*
+GENERATECRC16
+       LI   R7,CRCTABLE512    point to start of table
+       LI   R8,0              0 to 255
+LOOPI
+       MOV  R8,R10            get next CRC value into RESULT (R10)
+       SLA  R10,8             RESult shifted LEFT 8 bits
+       CLR  R1                for table, always start as if cleared
+*      XOR  R10,R1            XOR it with starting value
+       XOR  R1,R10            R1^R10: r10
+*inner loop here:
+       LI   R9,8              now for our inner loop
+LOOPJ  MOV  R10,R2            R2=temp
+       ANDI R2,>8000
+       SLA  R10,1
+       CI   R2,>8000          temp have msbit set?
+       JNE  SKIP              no
+       LI   R3,>1021
+*      XOR  R10,R3            yes, XOR it
+       XOR  R3,R10
+SKIP   DEC  R9                any left?
+       JNE  LOOPJ             yes
+*end inner loop
+       MOV  R10,*R7+     move crc value into table
+       INC  R8           +1
+       CI   R7,CRCTABLE512+512  last entry?
+       JNE  LOOPI
+       RT
+*-------------------------------------------------------------------------------
+*
+STRTUP LI   R0,LOADED         put in 'MDOS is starting ...'
+       LI   R1,>0A42          in last line of box
+       BL   @PUTMSH           do it
+       LWPI >F000             start up MDOS
+       CLR  R4
+       MOVB R4,@>8000
+       LI   R14,STUPST
+       LI   R15,>F080
+       LI   R12,>1EF4
+LOOP   MOV  *R14+,*R15+
+       CI   R14,STUPEN
+       JNE  LOOP
+       B    @>F080
+STUPST SBO  0
+       CLR  @>F04E
+       CLR  @>F110
+       BLWP @0
+STUPEN
+*
+SETMAP MOVB R7,@>8005         set to map logical >A000
+       AI   R7,>0100
+       MOVB R7,@>8006         set to map logical >C000
+       AI   R7,>0100
+       RT
+*
+DSRSUB MOV  @SCS,@DRIO        set drive # and read flag
+       MOV  R4,R1             sector # to get
+       MPY  R9,R1             mpy sec/au by the sector to get
+       MOV  R2,@SECLM         load low and mid
+       MOV  R1,@SECH          load high
+       MOV  R10,@PONTR        cpu buffer to load to
+       BLWP @SCSLNK           i/o
+       DATA 10
+       MOVB @SECLM,@SECLM     any error?
+       JNE  DSRERR            yes
+       INCT R11               good return
+DSRERR RT
+*
+
+; This routine was reading one sector into a temporary buffer only
+; to turn around and copy it into the destination by the caller.
+;
+; 4.28, R1 now set by caller (for >a000 to >df00 range)
+DSRSEC MOV  @SCS,@DRIO
+       MOV  R4,@SECLM         load low/mid
+       MOV  R5,@SECH          load high
+
+;      LI   R1,SECBUF     4.28    cpu buffer to load to (fast ram)
+       MOV  R1,@PONTR         cpu buffer to load to
+       BLWP @DSRLNK           i/o
+       DATA 10
+       CLR  @SECLM            kill read error (ouch!)
+       MOVB @SECLM,@SECLM     any error?
+       JNE  DSRERS            don't see how, but if there is
+       INCT R11               good return
+DSRERS RT                     bad return
+*
+DRIO   EQU  >834C             drive and i/o type
+PONTR  EQU  >834E             pointer to cpu buffer
+SECLM  EQU  >8350             sector # to get low/mid
+SECH   EQU  >8352             sector # to get high
+SCSIO  DATA >0180   >0120             scs i/o type
+SCS    DATA >8101   >A101     cpu|driv
+TOTFIL BYTE 0                 total files in root
+*  system support utilities
+VSBR   DATA >8300,VSBRO
+VSBRO  BL   @VPADD1
+       MOVB @>8800,@2(R13)
+       RTWP
+*
+VPADD1 CLR  R1
+       MOV  *R13,R2
+       MOVB @VPLAD,@>8C02
+       SOC  R1,R2
+       MOVB R2,@>8C02
+       MOV  @2(R13),R1
+       MOV  @4(R13),R2
+       RT
+*
+VPLAD  EQU  >8305
+SCLEN  EQU  >8354
+SCNAME EQU  >8356
+CRULST EQU  >83D0
+SADDR  EQU  >83D2
+GPLWS  EQU  >83E0
+FLGPTR DATA 0
+SVGPRT DATA 0
+SAVCRU DATA 0
+SAVENT DATA 0
+SAVLEN DATA 0
+SAVPAB DATA 0
+SAVVER DATA 0
+NAMBUF DATA 0,0,0,0,0
+DLNKWS DATA 0,0,0,0,0
+TYPE   DATA 0,0,0,0,0,0,0,0,0,0,0
+C100   DATA 100
+H20    EQU  $
+H2000  DATA >2000
+DECMAL TEXT '.'
+HAA    BYTE >AA
+*
+SCSLNK DATA DLNKWS,SCENTR     SCS dsrlnk entry init i/o
+SCENTR MOV  *R14+,R5
+       SZCB @H20,R15
+SROMW  LWPI GPLWS
+       CLR  @SAVCRU           no cru found yet
+NOROMW LI   R12,IDECRU     >1200         cru address of SCSI card
+       SBO  0                 turn on board
+       LI   R2,>4000
+       CB   *R2,@HAA
+       JNE  NODSRW            SCSI card not found
+       A    @TYPE,R2
+       JMP  WSGO2
+WSGO   MOV  @SADDR,R2
+       SBO  0
+WSGO2  MOV  *R2,R2            any entries available
+       JEQ  NODSRW            no
+       MOV  R2,@SADDR
+       INCT R2
+       MOV  *R2+,R9           execute address
+       MOV  @SCSIO,R5         test if length of sub is a 1
+       CB   R5,*R2+           is it?
+       JNE  WSGO              no
+       SWPB R5                test for call type of SCS file i/o
+       CB   R5,*R2+           is it?
+       JNE  WSGO              not yet
+*   If we get here then this is the SCSI card
+       MOV  R9,@SAVENT        save to start address for SCS file i/o sub
+       MOV  R12,@SAVCRU       save cru base for board
+       BL   *R9               go do the open
+       JMP  NODSRW            take rtn for not no SCSI card
+       SBZ  0                 turn off board
+       LWPI DLNKWS
+       MOV  R9,R0
+       BLWP @VSBR
+       SRL  R1,13
+       JNE  IOERRW
+       RTWP
+NODSRW LWPI DLNKWS
+       CLR  R1
+IOERRW SWPB R1
+       MOVB R1,*R13
+       SOCB @H20,R15          error status
+       RTWP
+*   dsrlnk for getting file when cru base and entry point are known
+DSRLNK DATA >F040,DLENTR
+DLENTR MOV  *R14+,R5
+       SZCB @H20,R15
+       LWPI GPLWS
+       MOV  @SAVCRU,R12       cru base for SCSI
+       SBO  0                 turn it on
+       MOV  @SAVENT,R9        get entry point for sub
+       BL   *R9               go to it
+       JMP  NODSR
+       SBZ  0                 turn off board
+       LWPI >F040
+       MOV  R9,R0
+       BLWP @VSBR
+       SRL  R1,13
+       JNE  IOERR
+       RTWP
+NODSR  LWPI >F040
+       CLR  R1
+IOERR  SWPB R1
+       MOVB R1,*R13
+       SOCB @H20,R15
+       RTWP
+*   this routine will search for the fdr for SYSTEM/SYS
+*   on 'SCS1.' and set things up for load if found
+*   return is +2 if found
+*   if not found return is normal
+FNDFIL DATA >F020,FIND
+FIND   MOVB @TOTFIL,R6        get files count in root
+       JEQ  NOTFND            no files in root
+       SRL  R6,8
+       CLR  R12               last fdr accessed
+       CLR  R5                low sector
+FINDF3 MOV  R5,R7             work L
+       MOV  R6,R8             work H
+       S    R7,R8             H-L
+       CI   R8,1              end of search
+       JEQ  FINDF4            yes, no divide
+       SRL  R8,1              divide by 2
+FINDF4 A    R5,R8             +L
+       C    R12,R8            has this fdr been tried
+       JEQ  NOTFND            yes, file not found
+       MOV  R8,R12            save this as last
+       SLA  R8,1              make a word
+       AI   R8,MYBUF1-2       point to an entry
+       MOV  *R8,R4            fdr to read
+       LI   R10,MYBUF
+       MOV  @18(R13),R9       get sector/au
+       BL   @DSRSUB
+       JMP  NOTFND            disk error
+       LI   R2,SYSSYS         file name
+       LI   R3,10
+FINDF5 CB   *R2+,*R10+        is this the file
+       JEQ  FINDF6            good do far
+       JLT  FINDF7            file read > file needed
+       MOV  R12,R5            number read < number needed new L
+       JMP  FINDF3            try again
+FINDF6 DEC  R3                all 10 tested
+       JNE  FINDF5            not yet
+*   found SYSTEM/SYS so setup load parms
+*   make sure this is a program file
+       MOVB @MYBUF+12,R2      get file status byte
+       SLA  R2,8              test program flag
+       JNC  NOTFND            its not a pgm file
+       MOV  @MYBUF+14,@12(R13) move total sector to callers R6
+       MOV  @MYBUF+40,R1      get starting sector in 1st cluster
+       MOV  R1,@8(R13)        move it to callers R4
+       MOV  @MYBUF+42,R2      get ending sector in cluster
+       S    R1,R2             figure total sectors in cluster
+       INC  R2
+       MOV  R2,@24(R13)       move this to callers R12
+       LI   R1,52             total of 52 more clusters are available
+       MOV  R1,@MXCLU         save it
+       LI   R1,MYBUF+44       set pointer to next cluster start
+       MOV  R1,@SEGSRT        save it
+       INCT R14               good return
+NOTFND RTWP
+FINDF7 MOV  R12,R6            new h
+       JMP  FINDF3            try again
+*   update starting sector in cluster for the load file
+SEGSRT DATA 0
+MXCLU  DATA 0                 counter for # of clusters in fdr
+GETSGW DATA >F020,GTSGW
+GTSGW  MOV  @SEGSRT,R1        get pointer to next cluster start
+       MOV  *R1+,R2           start
+       MOV  *R1+,R3           end
+       MOV  R1,@SEGSRT        save next cluster start
+       MOV  R2,@8(R13)        new sector to start load
+       S    R2,R3             get total sectors in this cluster
+       INC  R3
+       MOV  R3,@24(R13)       move it to callers R12
+       DEC  @MXCLU            decrement count of clusters in the fdr
+       JNE  GTSGW2            more available
+*   it'll take a really fragmented SYSTEM/SYS to ever get this far
+       MOV  @MYBUF+32,R4      get the next fdr for file
+       MOV  @18(R9),R9        get the sectors/au value
+       LI   R10,MYBUF         get new fdr
+       BL   @DSRSUB           get it
+       JMP  NOTFDJ            take error exit
+       LI   R1,54             reset to total # clusters possible
+       MOV  R1,@MXCLU
+       LI   R1,MYBUF+40       set to start of clusters in this fdr
+       MOV  R1,@SEGSRT
+GTSGW2 RTWP
+*
+NOTFDJ LWPI >F000             main ws
+       B    @NOSCS
+VDPWD  EQU  >F100
+VDPWE  EQU  >8C00
+VDPWA9 EQU  >F102
+VDPWA0 EQU  >8C02
+INTKB  EQU  8
+CLRKB  EQU  9
+CBH92  BYTE >92
+CBH89  BYTE >89
+CBH3F  BYTE >3F
+SNDOFS BYTE >9F,>BF,>DF,>FF   constants to turn off sound
+       EVEN
+*   this routine will display on the screen the error message pointed
+*   to by R0. if an error is detected, the computer will
+*   perform a cold restart if the user wants to try to reboot again
+*
+*   select the upper 64K of ram to put message in
+BADLOD LI   R2,>F120
+       MOVB @CBH89,*R2        sound an error
+       MOVB @CBH3F,*R2
+       MOVB @CBH92,*R2
+       LI   R2,VRGTBL
+NEXREG MOV  *R2+,R1
+       JEQ  NEXRE1            all done so test for keyboard
+       BL   @SETVRG
+       JMP  NEXREG
+*   use text 1 mode to display the error message on the screen
+*   assume that the pattern name table is at >0000
+*   and that the pattern generator table is at >0800
+*   first move in 24*40 lines of blank
+NEXRE1 LI   R1,>0040          set address of write
+       BL   @SETVRG
+       LI   R2,24*40          40*24 screen
+       LI   R1,>2020          put in blanks
+BLKLOP MOVB R1,@VDPWD
+       DEC  R2
+       JNE  BLKLOP
+*   put in the error statement
+       LI   R1,>E041          put on line 13
+       BL   @PUTMSG
+*   load in press any key to retry
+       LI   R0,ASK1
+       LI   R1,>3042
+       BL   @PUTMSG
+*   load in character set
+       LI   R1,>C048
+       BL   @SETVRG
+       LI   R1,CHRSET
+       LI   R2,CHRSEU-CHRSET
+CTBLOP MOVB *R1+,@VDPWD
+       DEC  R2
+       JNE  CTBLOP
+       CLR  R2
+CTBLO1 DEC  R2
+       JNE  CTBLO1
+       BL   @SNDOFF           turn off sound
+*   test for a retry from the keyboard
+WAITKY CLR  R12
+       TB   INTKB
+       JEQ  WAITKY
+       SBZ  CLRKB             clear keyboard input
+       SBO  CLRKB
+       BLWP @0                try to reboot
+*
+SETVRG MOVB R1,@VDPWA9
+       SRC  R1,8
+       MOVB R1,@VDPWA9
+       SRC  R1,8
+       RT
+*
+SETVRH MOVB R1,@VDPWA0
+       SRC  R1,8
+       MOVB R1,@VDPWA0
+       SRC  R1,8
+       RT
+*
+PUTMSG MOV  R11,R10
+       BL   @SETVRG
+       MOVB *R0+,R2           get length of error message
+       SRL  R2,8
+EMSLOP MOVB *R0+,@VDPWD
+       DEC  R2
+       JNE  EMSLOP
+       B    *R10
+*
+PUTMSH MOV  R11,R10
+       BL   @SETVRH
+       MOVB *R0+,R2           get length of message
+       SRL  R2,8
+EMSLOQ MOVB *R0+,@VDPWE
+       DEC  R2
+       JNE  EMSLOQ
+       B    *R10
+*
+SNDOFF LI   R1,SNDOFS
+SNDOF1 MOVB *R1+,@>F120
+       CI   R1,SNDOFS+4
+       JNE  SNDOF1
+       RT
+       EVEN
+*
+VRGTBL DATA >0080,>5081,>4082,>2184,>F187,>0888,>0089,>048E
+CBH0   DATA >0000
+*   Text messages
+NOFDR1 BYTE 18
+       TEXT 'No FDR table found'
+NOSYS1 BYTE 38
+       TEXT 'Cannot locate '
+SYSSYS TEXT 'SYSTEM/SYS file on IDE1.'     ;1st 10 characters = loaded filename
+ASK1   BYTE 22
+       TEXT 'Press any key to retry'
+NOSCS1 BYTE 29
+       TEXT 'Cannot locate IDE controller '
+NOTINT BYTE 24
+       TEXT 'SYSTEM/SYS is not intact'
+LOADNG DATA >EE1D,>1F1F,>1F1F,>1F1F,>1F1F
+       DATA >1F1F,>1F1F,>1F1F,>1F1F,>1F1F
+       DATA >1F1F,>1F1F,>1F1F,>1F1F,>1F1F
+       DATA >1F1F,>1F1F,>1F1F,>1F1F,>1A20,>2019
+       TEXT '              IDE_SYS               '
+       DATA >1920,>2019
+       TEXT '               v2.5i                '
+       DATA >1920,>201E,>1F1F,>1F1F,>1F1F,>1F1F
+       DATA >1F1F,>1F1F,>1F1F,>1F1F,>1F1F
+       DATA >1F1F,>1F1F,>1F1F,>1F1F,>1F1F
+       DATA >1F1F,>1F1F,>1F1F,>1F1F,>1820,>2019
+       TEXT '  Loading SYSTEM/SYS from IDE  ...  '
+       DATA >1920,>201C,>1F1F,>1F1F,>1F1F,>1F1F
+       DATA >1F1F,>1F1F,>1F1F,>1F1F,>1F1F
+       DATA >1F1F,>1F1F,>1F1F,>1F1F,>1F1F
+       DATA >1F1F,>1F1F,>1F1F,>1F1F,>1B20
+CRCCHK BYTE 36
+       TEXT '    Calculating CRC for MDOS ...    '
+       EVEN
+LOADED BYTE 36
+       TEXT '        MDOS is starting ...        '
+*   character set
+       EVEN
+CHRSET DATA >4848,>C808,>08C8,>4848     24
+       DATA >4848,>4848,>4848,>4848     25
+       DATA >0000,>F808,>08C8,>4848     26
+       DATA >4848,>C808,>08F8,>0000     27
+       DATA >4848,>4C40,>407C,>0000     28
+       DATA >0000,>7C40,>404C,>4848     29
+       DATA >4848,>4C40,>404C,>4848     30
+       DATA >0000,>FC00,>00FC,>0000     31
+       DATA >0000,>0000,>0000,>0000     32
+       DATA >0010,>1010,>1000,>1000     33
+       DATA >0028,>2828,>0000,>0000     34
+       DATA >0028,>7C28,>287C,>2800     35
+       DATA >0038,>5430,>1854,>3800     36
+       DATA >0044,>4C18,>3064,>4400     37
+       DATA >0020,>5020,>5448,>3400     38
+       DATA >0008,>1020,>0000,>0000     39
+       DATA >0008,>1010,>1010,>0800     40
+       DATA >0020,>1010,>1010,>2000     41
+       DATA >0044,>287C,>2844,>0000     42
+       DATA >0010,>107C,>1010,>0000     43
+       DATA >0000,>0000,>0030,>1020     44
+       DATA >0000,>007C,>0000,>0000     45
+       DATA >0000,>0000,>0030,>3000     46
+       DATA >0004,>0810,>2040,>0000     47
+       DATA >003C,>4C54,>6444,>3800     48
+       DATA >0010,>3010,>1010,>3800     49
+       DATA >0038,>4408,>1020,>7C00     50
+       DATA >0038,>4418,>0444,>3800     51
+       DATA >0008,>1828,>487C,>0800     52
+       DATA >0078,>4078,>0444,>3800     53
+       DATA >0038,>4078,>4444,>3800     54
+       DATA >007C,>0408,>1020,>2000     55
+       DATA >0038,>4438,>4444,>3800     56
+       DATA >0038,>4444,>3C04,>7800     57
+       DATA >0000,>3030,>0030,>3000     58
+       DATA >0000,>3030,>0030,>1020     59
+       DATA >0000,>1020,>4020,>1000     60
+       DATA >0000,>007C,>007C,>0000     61
+       DATA >0000,>1008,>0408,>1000     62
+       DATA >0038,>4408,>1000,>1000     63
+       DATA >0038,>4454,>5840,>3C00     64
+       DATA >0038,>4444,>7C44,>4400     65
+       DATA >0078,>2438,>2424,>7800     66
+       DATA >0038,>4440,>4044,>3800     67
+       DATA >0078,>2424,>2424,>7800     68
+       DATA >007C,>4078,>4040,>7C00     69
+       DATA >007C,>4078,>4040,>4000     70
+       DATA >0038,>4440,>4C44,>3800     71
+       DATA >0044,>447C,>4444,>4400     72
+       DATA >0038,>1010,>1010,>3800     73
+       DATA >0004,>0404,>0444,>3800     74
+       DATA >0044,>4850,>7048,>4400     75
+       DATA >0040,>4040,>4040,>7C00     76
+       DATA >0044,>6C54,>4444,>4400     77
+       DATA >0044,>6454,>544C,>4400     78
+       DATA >0038,>4444,>4444,>3800     79
+       DATA >0078,>4444,>7840,>4000     80
+       DATA >0038,>4444,>544C,>3C00     81
+       DATA >0078,>4444,>7848,>4400     82
+       DATA >0038,>4430,>0844,>3800     83
+       DATA >007C,>1010,>1010,>1000     84
+       DATA >0044,>4444,>4444,>3800     85
+       DATA >0044,>4444,>4428,>1000     86
+       DATA >0044,>4444,>5454,>2800     87
+       DATA >0044,>2810,>1028,>4400     88
+       DATA >0044,>4428,>1010,>1000     89
+       DATA >007C,>0810,>2040,>7C00     90
+       DATA >0038,>2020,>2020,>3800     91
+       DATA >0000,>4020,>1008,>0400     92
+       DATA >0038,>0808,>0808,>3800     93
+       DATA >0010,>3854,>1010,>1000     94
+       DATA >0000,>0000,>0000,>7C00     95
+       DATA >0020,>1008,>0000,>0000     96
+       DATA >0000,>0038,>4848,>3C00     97
+       DATA >0020,>2038,>2424,>3800     98
+       DATA >0000,>001C,>2020,>1C00     99
+       DATA >0004,>041C,>2424,>1C00     100
+       DATA >0000,>001C,>2830,>1C00     101
+       DATA >000C,>1038,>1010,>1000     102
+       DATA >0000,>001C,>241C,>0438     103
+       DATA >0020,>2038,>2424,>2400     104
+       DATA >0010,>0030,>1010,>3800     105
+       DATA >0008,>0008,>0808,>4830     106
+       DATA >0020,>2024,>3828,>2400     107
+       DATA >0030,>1010,>1010,>3800     108
+       DATA >0000,>0078,>5454,>5400     109
+       DATA >0000,>0038,>2424,>2400     110
+       DATA >0000,>0018,>2424,>1800     111
+       DATA >0000,>0038,>2438,>2020     112
+       DATA >0000,>001C,>241C,>0404     113
+       DATA >0000,>0028,>3420,>2000     114
+       DATA >0000,>001C,>300C,>3800     115
+       DATA >0010,>1038,>1010,>0C00     116
+       DATA >0000,>0024,>2424,>1C00     117
+       DATA >0000,>0044,>2828,>1000     118
+       DATA >0000,>0044,>5454,>2800     119
+       DATA >0000,>0024,>1818,>2400     120
+       DATA >0000,>0024,>241C,>0438     121
+       DATA >0000,>003C,>0810,>3C00     122
+       DATA >000C,>1010,>2010,>100C     123
+       DATA >0010,>1010,>0010,>1010     124
+       DATA >0060,>1010,>0810,>1060     125
+       DATA >0000,>2054,>0800,>0000     126
+       DATA >0000,>0000,>0000,>0000     127
+CHRSEU EQU  $
+       EVEN
+H1021  DATA >1021        crc polynomial
+CT9995 DATA 0
+CRCLIST     DATA 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+USERCRC     DATA 0
+MDOSCRC     DATA 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+*
+
+; Careful; slast was in wrong spot !
+SLAST
+
+; use EQUate to reduce size of file by approx 1k
+CRCTABLE512 EQU  $                BSS 530
+SAVE9995    EQU  CRCTABLE512+530  BSS 260
+MYBUF   EQU  SAVE9995+260     BSS 256
+MYBUF1  EQU  MYBUF+256        BSS  256
+LASTBUF EQU  MYBUF+256   NOT USED; placeholder
+;SECBUF BSS  256     4.28, no longer needed
+       END
+
+; end :)
+
